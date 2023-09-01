@@ -1,0 +1,95 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - master
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: self-hosted
+    steps:
+    - name: CHECK OUT CODE
+      uses: actions/checkout@v3
+
+    - name: EXTRACT REPOSITORY NAME
+      run: |
+        echo "REPO_NAME=$(echo '${{ github.repository }}' | awk -F '/' '{print $2}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+        echo "REPO_NAME_ORIGINAL=$(echo '${{ github.repository }}' | awk -F '/' '{print $2}')" >> $GITHUB_ENV
+
+    - name: DOCKER LOGIN
+      run: echo '${{ secrets.DOCKER_PASSWORD }}' | docker login dockerhub.example.com --username ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+    - name: INCREMENT VERSION
+      id: increment_version
+      run: |
+        tags=$(curl -s -u '${{ secrets.DOCKER_USERNAME }}:${{ secrets.DOCKER_PASSWORD }}' https://dockerhub.example.com/api/v2.0/projects/docker-registry/repositories/$REPO_NAME/artifacts | jq -r '[ .[] | select(.tags != null) | .tags[].name ] | join("\n")')
+
+        # Find the latest tag
+        latest_tag=$(echo "$tags" | grep -P "^v\d+\.\d+\.\d+$" | sort -V | tail -n 1)
+
+        # Increment the version
+        if [[ -z "$latest_tag" ]]; then
+          new_version="v0.0.1"
+        else
+          parts=(${latest_tag//./ })
+          v=${parts[0]//v/}
+          major=${parts[1]}
+          minor=${parts[2]}
+
+          if (( minor == 9 )); then
+            minor=0
+            if (( major == 9 )); then
+              major=0
+              v=$((v + 1))
+            else
+              major=$((major + 1))
+            fi
+          else
+            minor=$((minor + 1))
+          fi
+
+          new_version="v$v.$major.$minor"
+        fi
+        echo "New version: $new_version"
+        echo "NEW_VERSION=$new_version" >> $GITHUB_ENV
+        echo "version=$new_version" >> $GITHUB_ENV
+
+    - name: SET FILE PERMISSIONS
+      run: chmod -R 777 /runner/_work/$REPO_NAME_ORIGINAL/$REPO_NAME_ORIGINAL/
+
+    - name: INSTALL DEPENDENCIES AND RUN TESTS
+      run: |
+        python3.10 -m venv venv
+        source venv/bin/activate
+        python -V  # should output Python 3.10.x
+        echo '${{ secrets.DOCKER_PASSWORD }}' | docker login dockerhub.example.com --username ${{ secrets.DOCKER_USERNAME }} --password-stdin
+        cd /runner/_work/$REPO_NAME_ORIGINAL/$REPO_NAME_ORIGINAL/  # move to the directory where pytest is to be run
+        pip install --no-deps --ignore-installed -r requirements.txt
+        export PYTHONPATH="${PYTHONPATH}:/runner/_work/$REPO_NAME_ORIGINAL/$REPO_NAME_ORIGINAL/" # Add your project directory to the PYTHONPATH
+        pytest -v
+      env:
+        GIT_PERSONAL_ACCESS_TOKEN: ${{ secrets.GIT_PERSONAL_ACCESS_TOKEN }}
+    
+    - name: BUILD DOCKER IMAGE
+      run: |
+          docker build --network=host -t dockerhub.example.com/docker-registry/$REPO_NAME:latest .
+          docker build --network=host -t dockerhub.example.com/docker-registry/$REPO_NAME:${{ env.version }} .
+
+    - name: PUSH DOCKER IMAGE
+      run: |
+          docker push dockerhub.example.com/docker-registry/$REPO_NAME:latest
+          docker push dockerhub.example.com/docker-registry/$REPO_NAME:${{ env.version }}
+
+    - name: CONFIGURE KUBERNETES CONTEXT
+      run: |
+        echo "${{ secrets.KUBECONFIG_PROD }}" | base64 --decode > kubeconfig.yaml
+        context=$(kubectl config get-contexts -o name --kubeconfig=kubeconfig.yaml | head -n 1)
+        kubectl config use-context $context --kubeconfig=kubeconfig.yaml
+
+    - name: DEPLOY TO KUBERNETES
+      run: |
+        export IMAGE_TAG=${{ env.NEW_VERSION }}
+        envsubst < kubernetes-config.yaml > kubernetes-manifests.yaml
+        kubectl apply -f kubernetes-manifests.yaml --kubeconfig=kubeconfig.yaml
